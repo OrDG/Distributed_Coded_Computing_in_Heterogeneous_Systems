@@ -71,15 +71,6 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     if rank == 0:  # ######################################### Master ################################################
-        # Calculate num of images per worker
-        partition_array = [0, 0.3, 0.3, 0.4]
-        for index in range(len(partition_array)-1):
-            partition_array[index+1] = partition_array[index] + partition_array[index+1]
-        index_partition = np.array([int(frac*batch_size) for frac in partition_array])
-
-        sys.stdout.write('Master: partition indexes = ' + str(index_partition) + '\n')
-        sys.stdout.flush()
-
         # Get  MNIST dataset
         mnist_train_dataset = torchvision.datasets.MNIST(root='./datasets/',
                                                          train=True,
@@ -136,29 +127,66 @@ if __name__ == '__main__':
                 # sending job matrix to each worker
                 send_req_mat = []
                 for worker_rank in range(1, size):
-                    send_req_mat.append(comm.Isend([np.array(code_matrix[num_jobs_partition[worker_rank-1]:num_jobs_partition[worker_rank], :]
-                                                             , dtype='i'), MPI.INT], dest=worker_rank))
+                    send_req_mat.append(comm.Isend([np.array(code_matrix[num_jobs_partition[worker_rank-1]:
+                                                                         num_jobs_partition[worker_rank], :], dtype='float')
+                                                       , MPI.FLOAT], dest=worker_rank))
                 MPI.Request.waitall(send_req_mat)
 
-                # getting calculated gradients from each worker (needs update)
-                grad_buffer_list = []
+                # getting calculated gradients and job vectors from each worker (needs update)
+                grad_buffer_list = []  # for getting job's gradients
+                job_vect_buffer_list = []  # for getting job's vector
                 for worker_rank in range(1, size):
-                    grad_buffer_list.append([np.empty(param.size(), dtype='float') for param in model.parameters()]) # creating buffer
+                    for j in range(num_jobs_array[worker_rank-1]):
+                        grad_buffer_list.append([np.empty(param.size(), dtype='float') for param in model.parameters()]) # creating buffer
+                        job_vect_buffer_list.append(np.empty([n], dtype='float'))
 
-                recv_grad_req = []
+                # opening Irecv requests for all possible jobs
+                recv_grad_req = []  # for getting job's gradients
+                recv_job_vect_req = []  # for getting job's vector
                 for worker_rank in range(1, size):
-                    for index, param in enumerate(model.parameters()):
-                        recv_grad_req.append(comm.Irecv([grad_buffer_list[worker_rank-1][index], MPI.FLOAT],
-                                                        source=worker_rank))
+                    for j in range(num_jobs_array[worker_rank-1]):
+                        recv_job_vect_req.append(comm.Irecv([job_vect_buffer_list[num_jobs_partition[worker_rank-1]+j], MPI.FLOAT],
+                                                            source=worker_rank, tag=j))
+                        for index, param in enumerate(model.parameters()):
+                            recv_grad_req.append(comm.Irecv([grad_buffer_list[num_jobs_partition[worker_rank-1]+j][index], MPI.FLOAT],
+                                                            source=worker_rank, tag=n*(index+1)+j))
 
-                MPI.Request.waitall(recv_grad_req)
+                # waiting for only k jobs to be finished, and saving their gradients and vectors
+                finished_jobs_grad_list = []
+                finished_jobs_mat = np.empty([k, n], dtype='float')
+                for num_finished_job in range(k):
+                    index_finished_job, _ = MPI.Request.waitany(recv_job_vect_req)  # returns the finished req index
 
-                # aggregating gradients from results and update model parameters (needs update)
+                    # worker_rank = np.argmax(num_jobs_partition - index_finished_job > 0)  # finds the worker rank because np.argmax returns the first True index
+                    # job_num = index_finished_job - num_jobs_partition[worker_rank-1]  # finds the jobs index per worker
+
+                    finished_jobs_grad_list.append(grad_buffer_list[index_finished_job][:])
+                    finished_jobs_mat[num_finished_job, :] = job_vect_buffer_list[index_finished_job]
+
+                # sending message that the iteration is finished and cancel all left calcs and reqs
+                finished_iter_req = []
+                for worker_rank in range(1, size):
+                    finished_iter_req.append(comm.Isend([np.zeros([1]), MPI.INT], dest=worker_rank, tag=999999))
+                MPI.Request.waitall(finished_iter_req)
+
+                # canceling all recv req
+                for recv_req in recv_job_vect_req:
+                    if not MPI.Request.Test(recv_req):
+                        MPI.Request.Cancel(recv_req)
+
+                for recv_req in recv_grad_req:
+                    if not MPI.Request.Test(recv_req):
+                        MPI.Request.Cancel(recv_req)
+
+                # calculating coefficients for gradient aggregation
+                coeff_vect = genb.calc_agg_coeff(finished_jobs_mat)
+
+                # aggregating gradients from results and update model parameters
                 optimizer.zero_grad()
                 for index, param in enumerate(model.parameters()):
-                    grad_arr = np.zeros(np.array(grad_buffer_list[0][index]).shape, dtype='float')
-                    for worker_rank in range(1, size):
-                        grad_arr += np.array(grad_buffer_list[worker_rank - 1][index], dtype='float') # * partition_array[worker_rank]
+                    grad_arr = np.zeros(finished_jobs_grad_list[0][index].shape, dtype='float')
+                    for job_inx in range(k):
+                        grad_arr += finished_jobs_grad_list[job_inx][index] * coeff_vect[job_inx]
                     param.grad = torch.from_numpy(grad_arr).float()
                 optimizer.step()
 
@@ -200,37 +228,75 @@ if __name__ == '__main__':
                 jobs_mat_shape_req.wait()
 
                 # recv jobs matrix
-                jobs_mat = np.empty(jobs_mat_shape, dtype='i')
-                jobs_mat_shape_req = comm.Irecv([jobs_mat, MPI.INT], source=0)
-                jobs_mat_shape_req.wait()
+                jobs_mat = np.empty(jobs_mat_shape, dtype='float')
+                jobs_mat_req = comm.Irecv([jobs_mat, MPI.FLOAT], source=0)
+                jobs_mat_req.wait()
 
-                # load data on device (needs update)
-                images = torch.from_numpy(images).float()
-                labels = torch.from_numpy(labels).long()
+                # opening finish req
+                recv_fin_iter_req = comm.Irecv([np.empty([1]), MPI.INT], source=0, tag=999999)
 
-                images = images.to(device).view(int(labels_shape), -1)  # represent images as column vectors
-                labels = labels.to(device)
+                # extracting all jobs properties
+                k_p = jobs_mat.shape[0]
+                n = jobs_mat.shape[1]
+                d = np.sum(jobs_mat[0, :] != 0)
+                partition_vect = np.arange(start=0, stop=batch_size, step=(batch_size/n), dtype='i')  # vector of start indices for each possible calcs
 
-                # Forward pass (needs update)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                optimizer.zero_grad()  # zero (flush) the gradients from the previous iteration
-                loss.backward()  # calculate the gradients w.r.t the loss function (saved in tensor.grad field)
+                # calc and send gradients per job
+                send_tot_grad_job_req = []
+                send_job_vect_req = []
+                for job_p_inx in range(k_p):
+                    # checking if finished iteration message was sent, and breaking if so
+                    if recv_fin_iter_req.Test():
+                        break
 
-                # print worker's learning status
-                if (i + 1) % 100 == 0:
-                    sys.stdout.write('Worker ' + str(rank) + ' : Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, Time: {:.4f} '
-                                                         's'.format(epoch + 1, num_epochs, i+1, total_step, loss.item(),
-                                                                    time.time() - start_time) + '\n')
-                    sys.stdout.flush()
+                    # extracting specific job properties
+                    job_p_vect = jobs_mat[job_p_inx, :]  # vector of coeff for the job
+                    partition_vect_per_job = partition_vect[job_p_vect != 0]  # vector of relevant partition indices
+                    job_p_vec_sq = job_p_vect[job_p_vect != 0]  # vector of non-zero coeffs
 
-                # get loss gradients and send to the master (needs update)
-                send_grad_req = []
-                for name, param in model.named_parameters():
-                    send_grad = np.array(param.grad, dtype='float')
-                    send_grad_req.append(comm.Isend([send_grad, MPI.FLOAT], dest=0))
+                    # preforming specific job calculations
+                    tot_grad_list = [np.zeros(param.size(), dtype='float') for param in model.parameters()]  # initializing total gradient list
+                    for calc_num, index_calc_part in enumerate(partition_vect_per_job):
+                        # getting relevant images and labels for a calc from the job
+                        images_per_calc = torch.from_numpy(images[index_calc_part:index_calc_part + int(batch_size/n),
+                                                           :, :, :]).float().to(device).view(int(batch_size/n), -1)
+                        labels_per_calc = torch.from_numpy(labels[index_calc_part:index_calc_part + int(batch_size/n)]
+                                                           ).long().to(device)
 
-                MPI.Request.waitall(send_grad_req)
+                        outputs = model(images_per_calc)
+                        loss = criterion(outputs, labels_per_calc)
+                        optimizer.zero_grad()  # zero (flush) the gradients from the previous iteration
+                        loss.backward()  # calculate the gradients w.r.t the loss function (saved in tensor.grad field)
+
+                        # print worker's learning status
+                        # if (i + 1) % 100 == 0:
+                        if calc_num == 0 and job_p_inx == 0:
+                            sys.stdout.write(
+                                'Worker ' + str(rank) + ' : Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}, Time: {:.4f} '
+                                                        's'.format(epoch + 1, num_epochs, i + 1, total_step,
+                                                                   loss.item(), time.time() - start_time) + '\n')
+                            sys.stdout.flush()
+
+                        # aggregating the gradients of the calc and mul by relevant coefficients
+                        for inx_param, param in enumerate(model.parameters()):
+                            tot_grad_list[inx_param] += np.array(param.grad, dtype='float') * job_p_vec_sq[calc_num]
+
+                    # sending total gradient of a job and its vector
+                    send_job_vect_req.append(comm.Isend([job_p_vect, MPI.FLOAT], dest=0, tag=job_p_inx))
+
+                    for index, tot_grad in enumerate(tot_grad_list):
+                        send_tot_grad_job_req.append(comm.Isend([tot_grad, MPI.FLOAT], dest=0, tag=n*(index+1)+job_p_inx))
+
+                # if finished all jobs before end of iter, wait for end of iter
+                if not recv_fin_iter_req.Test():
+                    recv_fin_iter_req.wait()
+
+                # canceling all send req
+                for send_req in send_tot_grad_job_req:
+                    MPI.Request.Cancel(send_req)
+
+                for send_req in send_job_vect_req:
+                    MPI.Request.Cancel(send_req)
 
                 # recv new parameters from master and update them in your model
                 recv_param_req = []
