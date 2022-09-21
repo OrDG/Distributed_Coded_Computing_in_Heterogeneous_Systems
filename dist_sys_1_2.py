@@ -61,7 +61,7 @@ if __name__ == '__main__':
     size_dataset = 60000
 
     # Device configuration
-    device = torch.device("cpu")
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     # create model, send it to device
     model = TwoLayerNet(D_in=28 * 28, H=256, D_out=10).to(device).float()
@@ -165,12 +165,13 @@ if __name__ == '__main__':
                 num_params = len(list(model.parameters()))
                 for num_finished_job in range(k):
                     index_finished_job, _ = MPI.Request.waitany(recv_job_vect_req)  # returns the finished req index
-                    worker_rank = np.argmax(num_jobs_partition - index_finished_job > 0)  # finds the worker rank because np.argmax returns the first True index
-                    MPI.Request.waitall(recv_grad_req[num_jobs_partition[worker_rank-1]*num_params:num_jobs_partition[worker_rank]*num_params])
+                    MPI.Request.waitall(recv_grad_req[index_finished_job * num_params:(index_finished_job+1) * num_params])
 
                     finished_jobs_grad_list[num_finished_job][:] = grad_buffer_list[index_finished_job][:]
                     finished_jobs_mat[num_finished_job, :] = job_vect_buffer_list[index_finished_job]
 
+                    # worker_rank = np.argmax(num_jobs_partition - index_finished_job > 0)  # finds the worker rank because np.argmax returns the first True index
+                    # MPI.Request.waitall(recv_grad_req[num_jobs_partition[worker_rank-1]*num_params:num_jobs_partition[worker_rank]*num_params])
                     # job_num = index_finished_job - num_jobs_partition[worker_rank-1]  # finds the jobs index per worker
 
                 # sending message that the iteration is finished and cancel all left calcs and reqs
@@ -197,14 +198,14 @@ if __name__ == '__main__':
                     grad_arr = np.zeros(finished_jobs_grad_list[0][index].shape, dtype='float')
                     for job_inx in range(k):
                         grad_arr += finished_jobs_grad_list[job_inx][index] * coeff_vect[job_inx]
-                    param.grad = torch.from_numpy(grad_arr).float()
+                    param.grad = torch.from_numpy(grad_arr).float().to(device)
                 optimizer.step()
 
                 # send new parameters of the model to the workers
                 send_reqs_params = []
                 for worker_rank in range(1, size):
                     for index, param in enumerate(model.parameters()):
-                        send_reqs_params.append(comm.Isend([np.array(param.data, dtype='float'), MPI.FLOAT], dest=worker_rank))
+                        send_reqs_params.append(comm.Isend([np.array(param.data.cpu(), dtype='float'), MPI.FLOAT], dest=worker_rank))
 
                 MPI.Request.waitall(send_reqs_params)
 
@@ -286,7 +287,7 @@ if __name__ == '__main__':
 
                         # aggregating the gradients of the calc and mul by relevant coefficients
                         for inx_param, param in enumerate(model.parameters()):
-                            tot_grad_list[inx_param] += np.array(param.grad, dtype='float') * job_p_vec_sq[calc_num]
+                            tot_grad_list[inx_param] += np.array(param.grad.cpu(), dtype='float') * job_p_vec_sq[calc_num]
 
                     # sending total gradient of a job and its vector
                     send_job_vect_req.append(comm.Isend([job_p_vect, MPI.FLOAT], dest=0, tag=job_p_inx))
@@ -317,4 +318,4 @@ if __name__ == '__main__':
                 MPI.Request.waitall(recv_param_req)
 
                 for index, param in enumerate(model.parameters()):
-                    param.data = torch.from_numpy(param_buffer[index]).float()
+                    param.data = torch.from_numpy(param_buffer[index]).float().to(device)
