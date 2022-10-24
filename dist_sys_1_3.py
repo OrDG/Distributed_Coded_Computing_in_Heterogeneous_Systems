@@ -41,11 +41,11 @@ if __name__ == '__main__':
     num_epocs_tp = int(np.ceil(num_total_runs_tp/num_runs_per_epoc))
     num_epocs_tp_kp = int(np.ceil(num_total_runs_tp_kp / num_runs_per_epoc))
 
-    sys.stdout.write('num_epocs_tp = {}, num_epocs_tp_kp = {}\n'.format(num_epocs_tp, num_epocs_tp_kp))
-    sys.stdout.flush()
-
     # Device configuration
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    sys.stdout.write('rank = {}, device = {}\n'.format(rank, device))
+    sys.stdout.flush()
 
     # create model, send it to device
     model = torchvision.models.resnet18(weights=None).to(device).float()
@@ -120,36 +120,40 @@ if __name__ == '__main__':
 
                         end_cp_time = time.time()
                         # saving communication time, we assume the diff between cp of workers is negligible
-                        comm_time.append(end_cp_time - start_cp_time)
+                        tmp_cp_time = end_cp_time - start_cp_time
+                        #comm_time.append(end_cp_time - start_cp_time)
 
                         # receiving grads for single task from each worker
                         # create relevant buffers for grads
                         grad_buffer_tp = []
-                        notif_buffer_tp = []
+                        time_buffer_tp = []
                         for worker_rank in range(1, size):
                             grad_buffer_tp.append([np.empty(param.size(), dtype='float') for param in model.parameters()])
-                            notif_buffer_tp.append(np.empty([1], dtype='i'))
+                            time_buffer_tp.append(np.empty([1], dtype='float'))
 
                         # opening recv req for finished notification and gradients
-                        recv_req_notif_tp = []
+                        recv_req_time_tp = []
                         recv_req_grad_tp = []
                         for worker_rank in range(1, size):
-                            recv_req_notif_tp.append(comm.Irecv([notif_buffer_tp[worker_rank-1], MPI.INT],
-                                                                source=worker_rank, tag=888888))
+                            recv_req_time_tp.append(comm.Irecv([time_buffer_tp[worker_rank-1], MPI.FLOAT],
+                                                               source=worker_rank, tag=888888))
                             for index, param in enumerate(model.parameters()):
                                 recv_req_grad_tp.append(comm.Irecv([grad_buffer_tp[worker_rank-1][index], MPI.FLOAT],
                                                                    source=worker_rank))
 
                         # waiting for notification from each worker and their grad
                         end_tp_time_vect = np.zeros((num_workers,), dtype=float)
-                        while not MPI.Request.Testall(recv_req_notif_tp):
-                            worker_index, _ = MPI.Request.waitany(recv_req_notif_tp)
+                        while not MPI.Request.Testall(recv_req_time_tp):
+                            worker_index, _ = MPI.Request.waitany(recv_req_time_tp)
                             MPI.Request.waitall(recv_req_grad_tp[worker_index*num_params:(worker_index+1)*num_params])
                             end_tp_time_vect[worker_index] = time.time()
 
                         if np.all(end_tp_time_vect >= end_cp_time):
-                            tp_time_vect = end_tp_time_vect - end_cp_time
-                            tp_time_vect_list.append(tp_time_vect)
+                            tp_cp_time_vect = end_tp_time_vect - end_cp_time
+                            time_tp_vect = np.array([float(tp_i) for tp_i in time_buffer_tp], dtype='float')
+                            cp_grad_time_vect = tp_cp_time_vect - time_tp_vect
+                            tp_time_vect_list.append(time_tp_vect)
+                            comm_time.append(tmp_cp_time + cp_grad_time_vect)
 
                 # ########### part 2:optimal load split #################
 
@@ -157,7 +161,7 @@ if __name__ == '__main__':
                 tp_time_array = np.array(tp_time_vect_list)
                 mean_tp_vect = np.mean(tp_time_array, axis=0)
                 var_tp_vect = np.var(tp_time_array, axis=0)
-                mean_comm_time_vect = np.ones_like(mean_tp_vect) * np.mean(np.array(comm_time))
+                mean_comm_time_vect = np.mean(np.array(comm_time), axis=0)
 
                 sys.stdout.write('Master:\n mean Tp = {}, var Tp = {}, mean_comm_time = {}\n'
                                  .format(mean_tp_vect, var_tp_vect, mean_comm_time_vect))
@@ -283,7 +287,7 @@ if __name__ == '__main__':
         df_metadata = pd.DataFrame(metadata_list, columns=['n', 'd', 'k', 'omega', 'c', 'mean_tp_vect', 'var_tp_vect',
                                                            'mean_comm_time_vect', 'task_split_vect', 'mean_tp_kp_vect',
                                                            'var_tp_kp_vect', 'mismatch', 'mean_time_iter'])
-        df_metadata.to_excel('/home/user/cloud/ProjectB/metadata_fixed.xlsx')
+        df_metadata.to_excel('/home/user/cloud/ProjectB/metadata_fixed_2.xlsx')
 
     else:  # ############################################################ Workers ##################################################################
         model.train()
@@ -325,6 +329,7 @@ if __name__ == '__main__':
                         code_vec_sq = code_vect[code_vect != 0]  # vector of non-zero coeffs
 
                         # preforming specific job calculations
+                        start_tp_calc_time = time.time()
                         tot_grad_list = [np.zeros(param.size(), dtype='float') for param in
                                          model.parameters()]  # initializing total gradient list
                         for calc_num, index_calc_part in enumerate(partition_vect_per_task):
@@ -352,13 +357,15 @@ if __name__ == '__main__':
                             for inx_param, param in enumerate(model.parameters()):
                                 tot_grad_list[inx_param] += np.array(param.grad.cpu(), dtype='float') * code_vec_sq[
                                     calc_num]
+                        end_tp_calc_time = time.time()
 
                         send_req_tot_grad_tp = [comm.Isend([tot_grad_list[index], MPI.FLOAT], dest=0) for index in
                                                 range(num_params)]
 
                         MPI.Request.waitall(send_req_tot_grad_tp)
-                        send_req_notif = comm.Isend([np.zeros([1], dtype='i'), MPI.INT], dest=0, tag=888888)
-                        send_req_notif.wait()
+                        send_req_time = comm.Isend([np.array([end_tp_calc_time - start_tp_calc_time], dtype='float'),
+                                                    MPI.FLOAT], dest=0, tag=888888)
+                        send_req_time.wait()
 
                 # ########### part 2:optimal load split #################
                 # get task partition indices
