@@ -17,9 +17,52 @@ import pandas as pd
 import socket
 
 
-def print_to_console(some_string: str):
+def print_to_console(some_string):
     sys.stdout.write(some_string)
     sys.stdout.flush()
+
+
+def get_mpi_data_type(data_type):
+    mpi_data_type = MPI.UNDEFINED
+    if data_type == 'float':
+        mpi_data_type = MPI.FLOAT
+    elif data_type == 'i':
+        mpi_data_type = MPI.INT
+    return mpi_data_type
+
+
+def send_data_master_to_all_workers_and_wait(data, data_type, tags=None):
+    send_reqs = []
+    for num_worker_rank in range(1, size):
+        mpi_data_type = get_mpi_data_type(data_type)
+        if tags is not None:
+            send_reqs.append(comm.Isend([np.array(data, dtype=data_type), mpi_data_type], dest=num_worker_rank,
+                                       tag=tags[num_worker_rank - 1]))
+        else:
+            send_reqs.append(comm.Isend([np.array(data, dtype=data_type), mpi_data_type], dest=num_worker_rank))
+    MPI.Request.waitall(send_reqs)
+
+
+def send_model_master_to_all_workers_and_wait(nn_model):
+    send_reqs = []
+    for nun_worker_rank in range(1, size):
+        for inx, param_i in enumerate(nn_model.parameters()):
+            send_reqs.append(comm.Isend([np.array(param_i.data.cpu(), dtype='float'), MPI.FLOAT], dest=nun_worker_rank,
+                                        tag=batch_size+inx))
+    MPI.Request.waitall(send_reqs)
+
+
+def get_dataset_train_loader_cifar10():
+    transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+
+    train_set_CIFAR10 = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                                     download=True, transform=transform)
+    train_loader_CIFAR10 = torch.utils.data.DataLoader(train_set_CIFAR10, batch_size=batch_size,
+                                                       shuffle=True, drop_last=True)
+    # We use drop_last=True to avoid the case where the data / batch_size != int
+
+    return train_loader_CIFAR10
 
 
 if __name__ == '__main__':
@@ -91,22 +134,10 @@ if __name__ == '__main__':
                                                                                                     k, omega, c))
 
                 # sends code matrix to each worker
-                send_req_code_matrix = []
-                for worker_rank in range(1, size):
-                    send_req_code_matrix.append(comm.Isend([np.array(code_matrix, dtype='float'), MPI.FLOAT],
-                                                           dest=worker_rank))
-
-                MPI.Request.waitall(send_req_code_matrix)
+                send_data_master_to_all_workers_and_wait(code_matrix, 'float')
 
                 # Get dataset
-                transform = transforms.Compose(
-                    [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
-                train_set_CIFAR10 = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                                                 download=True, transform=transform)
-                train_loader_CIFAR10 = torch.utils.data.DataLoader(train_set_CIFAR10, batch_size=batch_size,
-                                                                   shuffle=True, drop_last=True)
-                # We use drop_last=True to avoid the case where the data / batch_size != int
+                train_loader_CIFAR10 = get_dataset_train_loader_cifar10()
 
                 for epoch in range(num_epocs_tp):
                     for i, (images, labels) in enumerate(train_loader_CIFAR10):
@@ -114,35 +145,18 @@ if __name__ == '__main__':
                             break
                         # sending train-data shapes to each worker
                         start_cp_time = time.time()
-                        send_reqs_labels_shapes = []
-                        send_reqs_images_shapes = []
 
-                        for worker_rank in range(1, size):
-                            send_reqs_labels_shapes.append(comm.Isend([np.array(labels.size(), dtype='i'), MPI.INT],
-                                                                      dest=worker_rank))
-                            send_reqs_images_shapes.append(comm.Isend([np.array(images.size(), dtype='i'), MPI.INT],
-                                                                      dest=worker_rank))
-                        MPI.Request.waitall([*send_reqs_labels_shapes, *send_reqs_images_shapes])
+                        send_data_master_to_all_workers_and_wait(labels.size(), 'i')
+                        send_data_master_to_all_workers_and_wait(images.size(), 'i')
 
                         # send new parameters of the model to the workers
-                        send_reqs_params = []
-                        for worker_rank in range(1, size):
-                            for index, param in enumerate(model.parameters()):
-                                send_reqs_params.append(
-                                    comm.Isend([np.array(param.data.cpu(), dtype='float'), MPI.FLOAT],
-                                               dest=worker_rank, tag=batch_size+index))
+                        send_model_master_to_all_workers_and_wait(model)
 
-                                # sending train-data to each worker
-                        send_reqs_labels = []
-                        send_reqs_images = []
-
-                        for worker_rank in range(1, size):
-                            send_reqs_images.append(comm.Isend([np.array(images, dtype='float'), MPI.FLOAT],
-                                                               dest=worker_rank, tag=worker_rank * 2))
-                            send_reqs_labels.append(comm.Isend([np.array(labels, dtype='i'), MPI.INT], dest=worker_rank,
-                                                               tag=2*worker_rank+1))
-
-                        MPI.Request.waitall([*send_reqs_images, *send_reqs_params, *send_reqs_labels])
+                        # sending train-data to each worker
+                        send_data_master_to_all_workers_and_wait(images, 'float', tags=np.arange(start=2, stop=2*size, 
+                                                                                                 step=2))
+                        send_data_master_to_all_workers_and_wait(labels, 'i', tags=np.arange(start=3, stop=2*size+1, 
+                                                                                             step=2))
 
                         # saving communication time, we assume the diff between cp of workers is negligible
                         # end_cp_time = time.time()
