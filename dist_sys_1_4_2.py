@@ -64,8 +64,8 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-    num_print_cycle = 20
-    num_steps = 100
+    num_print_cycle = 2
+    num_steps = 10
 
     if rank == 0:  # ######################################### Master ################################################
         # ########### part 1: tp estimation #################
@@ -219,6 +219,9 @@ if __name__ == '__main__':
                             break
                         else:
                             task_split_vect = np.ones_like(task_split_vect, dtype='i') * int(n/num_workers)
+                            num_left_tasks = n - num_workers * int(n/num_workers)
+                            for j in range(num_left_tasks):
+                                task_split_vect[-j] += 1
 
                     task_partition = np.array([np.sum(task_split_vect[:j]) for j in range(num_workers + 1)], dtype='i')
 

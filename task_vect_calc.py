@@ -43,13 +43,14 @@ def find_task_split(mean_tp_vect, var_tp_vect, comm_cp_vect, init_theta, gamma, 
     return tmp_k_p_vect
 
 
-mean_vect_example = np.array([2, 1.3, 1.2], dtype='float')
-var_vect_example = np.array([0.2, 0.2, 0.2], dtype='float')
-comm_vect_example = np.array([0.5, 0.5, 0.5], dtype='float')
-init_big_theta = 100
-gamma = 1
-tot_task_num = 128
+if __name__ == '__main__':
+    mean_vect_example = np.array([2, 1.3, 1.2], dtype='float')
+    var_vect_example = np.array([0.2, 0.2, 0.2], dtype='float')
+    comm_vect_example = np.array([0.5, 0.5, 0.5], dtype='float')
+    init_big_theta = 100
+    gamma = 1
+    tot_task_num = 128
 
-task_vect = find_task_split(mean_vect_example, var_vect_example, comm_vect_example, init_big_theta, gamma, tot_task_num)
-print(task_vect)
+    task_vect = find_task_split(mean_vect_example, var_vect_example, comm_vect_example, init_big_theta, gamma, tot_task_num)
+    print(task_vect)
 

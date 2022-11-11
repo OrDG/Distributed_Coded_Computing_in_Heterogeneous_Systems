@@ -44,19 +44,19 @@ def get_code_coeff(b_mat):
     c = d / n
     return k, omega, c
 
+if __name__ == '__main__':
+    d1 = 4
+    n1 = 8
 
-d1 = 4
-n1 = 8
+    b_matrix = get_rnd_b_mat(d1, n1)
+    K1, Omega1, C1 = get_code_coeff(b_matrix)
+    print('Calculated B matrix = \n{}'.format(np.round(b_matrix, 3)))
+    print('K = {}, Omega = {}, C = {}'.format(K1, Omega1, C1))
 
-b_matrix = get_rnd_b_mat(d1, n1)
-K1, Omega1, C1 = get_code_coeff(b_matrix)
-print('Calculated B matrix = \n{}'.format(np.round(b_matrix, 3)))
-print('K = {}, Omega = {}, C = {}'.format(K1, Omega1, C1))
+    finished_job_b_mat = np.delete(b_matrix, range(n1-K1), axis=0)
+    print('Finished Job B matrix = \n{}'.format(np.round(finished_job_b_mat, 3)))
 
-finished_job_b_mat = np.delete(b_matrix, range(n1-K1), axis=0)
-print('Finished Job B matrix = \n{}'.format(np.round(finished_job_b_mat, 3)))
+    a_vect = calc_agg_coeff(finished_job_b_mat)
+    print('vector of coefficients for aggregation = \n{}'.format(np.round(a_vect, 3)))
 
-a_vect = calc_agg_coeff(finished_job_b_mat)
-print('vector of coefficients for aggregation = \n{}'.format(np.round(a_vect, 3)))
-
-print('final aggregate vect = \n{}'.format(np.transpose(finished_job_b_mat)@a_vect))
+    print('final aggregate vect = \n{}'.format(np.transpose(finished_job_b_mat)@a_vect))
