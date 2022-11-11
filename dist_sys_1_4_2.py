@@ -17,6 +17,11 @@ import pandas as pd
 import socket
 
 
+def print_to_console(some_string: str):
+    sys.stdout.write(some_string)
+    sys.stdout.flush()
+
+
 if __name__ == '__main__':
     comm = MPI.COMM_WORLD
     size = comm.Get_size()
@@ -50,8 +55,7 @@ if __name__ == '__main__':
     hostname = socket.gethostname()
     ip_addr = socket.gethostbyname(hostname)
 
-    sys.stdout.write('rank = {}, device = {}, ip addr = {}\n'.format(rank, device, ip_addr))
-    sys.stdout.flush()
+    print_to_console('rank = {}, device = {}, ip addr = {}\n'.format(rank, device, ip_addr))
 
     # create model, send it to device
     model = torchvision.models.resnet18(weights=None).to(device).float()
@@ -83,9 +87,8 @@ if __name__ == '__main__':
                 tp_calc_time_vect_list = []
                 tp_grad_time_vect_list = []
 
-                sys.stdout.write('Master: code matrix = \n{}\n k = {}, omega = {}, c = {}\n'.format(code_matrix,
+                print_to_console('Master: code matrix = \n{}\n k = {}, omega = {}, c = {}\n'.format(code_matrix,
                                                                                                     k, omega, c))
-                sys.stdout.flush()
 
                 # sends code matrix to each worker
                 send_req_code_matrix = []
@@ -197,9 +200,8 @@ if __name__ == '__main__':
                 mean_tp_grad_vect = np.mean(np.array(tp_grad_time_vect_list), axis=0)
                 mean_tp_calc_vect = np.mean(np.array(tp_calc_time_vect_list), axis=0)
 
-                sys.stdout.write('Master:\n mean Tp = {}, var Tp = {}, mean cp = {}, mean tp-calc = {}, mean tp-grad = {}\n'
+                print_to_console('Master:\n mean Tp = {}, var Tp = {}, mean cp = {}, mean tp-calc = {}, mean tp-grad = {}\n'
                                  .format(mean_tp_vect, var_tp_vect, mean_cp_vect, mean_tp_calc_vect, mean_tp_grad_vect))
-                sys.stdout.flush()
 
                 # get optimal load split
                 task_split_vect = task_vect_calc.find_task_split(mean_tp_vect, var_tp_vect, mean_cp_vect,
@@ -225,8 +227,7 @@ if __name__ == '__main__':
 
                     task_partition = np.array([np.sum(task_split_vect[:j]) for j in range(num_workers + 1)], dtype='i')
 
-                    sys.stdout.write('Master: task split = {}\n'.format(task_split_vect))
-                    sys.stdout.flush()
+                    print_to_console('Master: task split = {}\n'.format(task_split_vect))
 
                     # measure lists
                     tp_kp_time_vect_list = []
@@ -347,9 +348,8 @@ if __name__ == '__main__':
 
                     mean_time_iter = np.mean(np.array(t_iter_list, dtype='float'))
 
-                    sys.stdout.write('Master:\n mean Tp_kp = {}, var Tp_kp = {}\n mismatch = {}, mean Titer = {}\n'
+                    print_to_console('Master:\n mean Tp_kp = {}, var Tp_kp = {}\n mismatch = {}, mean Titer = {}\n'
                                      .format(mean_tp_kp_vect, var_tp_kp_vect, mismatch, mean_time_iter))
-                    sys.stdout.flush()
 
                     metadata_list.append(np.array([n, d, k, omega, c, mean_tp_vect, var_tp_vect, mean_cp_vect,
                                                    task_split_vect, mean_tp_kp_vect, var_tp_kp_vect, mismatch,
@@ -435,10 +435,9 @@ if __name__ == '__main__':
 
                             # print worker's learning status
                             if calc_num == 0 and (i + 1) % num_print_cycle == 0:
-                                sys.stdout.write('Worker {}: Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}\n'
+                                print_to_console('Worker {}: Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}\n'
                                                  .format(rank, epoch + 1, num_epocs_tp, i + 1, num_runs_per_epoc,
                                                          loss.item()))
-                                sys.stdout.flush()
 
                             # aggregating the gradients of the calc and mul by relevant coefficients
                             for inx_param, param in enumerate(model.parameters()):
@@ -548,10 +547,9 @@ if __name__ == '__main__':
 
                                     # print worker's learning status
                                     if calc_num == 0 and job_p_inx == 0 and (i + 1) % num_print_cycle == 0:
-                                        sys.stdout.write('Worker {}: Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}\n'
-                                                     .format(rank, epoch + 1, num_epocs_tp_kp, i + 1, num_runs_per_epoc,
-                                                             loss.item()))
-                                        sys.stdout.flush()
+                                        print_to_console('Worker {}: Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}\n'
+                                                         .format(rank, epoch + 1, num_epocs_tp_kp, i + 1,
+                                                                 num_runs_per_epoc, loss.item()))
 
                                     # aggregating the gradients of the calc and mul by relevant coefficients
                                     for inx_param, param in enumerate(model.parameters()):
