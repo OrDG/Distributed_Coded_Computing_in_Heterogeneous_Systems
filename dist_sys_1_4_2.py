@@ -31,6 +31,8 @@ def get_mpi_data_type(data_type):
     return mpi_data_type
 
 
+# ######################### Master Functions #########################
+
 def send_data_from_master_to_all_workers_and_wait(data, data_type, tags=None):
     send_reqs = []
     for num_worker_rank in range(1, size):
@@ -200,6 +202,72 @@ def update_tp_kp_time_if_needed(task_partitions, tasks_split, index_finished_tas
     task_num = index_finished_task - task_partitions[workers_rank - 1]  # finds the jobs index per worker
     if task_num == (tasks_split[workers_rank - 1] - 1):
         finished_tp_kp_times[workers_rank - 1] = time.time()
+
+
+# ###################################### Workers Functions ###################################
+
+def worker_wait_and_receive_data_from_master(data_shape, data_type, tag=None):
+    buffer = np.empty(data_shape, dtype=data_type)
+    mpi_data_type = get_mpi_data_type(data_type)
+    if tag:
+        receive_request = comm.Irecv([buffer, mpi_data_type], source=0, tag=tag)
+    else:
+        receive_request = comm.Irecv([buffer, mpi_data_type], source=0)
+    receive_request.wait()
+    return buffer
+
+
+def worker_wait_and_receive_model_params_from_master(nn_model):
+    receive_param_requests = []
+    parameters_buffer = [np.empty(param.size(), dtype='float') for param in nn_model.parameters()]
+    for inx, _ in enumerate(nn_model.parameters()):
+        receive_param_requests.append(comm.Irecv([parameters_buffer[inx], MPI.FLOAT], source=0,
+                                                 tag=batch_size + inx))
+
+    MPI.Request.waitall(receive_param_requests)
+    return parameters_buffer
+
+
+def get_relevant_batch_indices_and_coefficients_from_code_matrix(num_epoch, num_step, tasks_code_matrix):
+    # get a code vect from the code matrix
+    task_index = num_epoch * num_runs_per_epoc + num_step
+    num_tasks_in_matrix = tasks_code_matrix.shape[0]
+    code_index = task_index % num_tasks_in_matrix
+    code_vect = tasks_code_matrix[code_index, :]
+
+    relevant_partition_ind = partition_vect[code_vect != 0]  # vector of relevant partition indices
+    non_zero_code_coeffs = code_vect[code_vect != 0]  # vector of non-zero coeffs
+    return relevant_partition_ind, non_zero_code_coeffs
+
+
+def preform_a_calculation_and_update_total_gradient(total_grad_list, images_for_calc, labels_for_calc,
+                                                    relevant_coefficient):
+    images_per_calc = torch.from_numpy(images_for_calc).float().to(device)
+    labels_per_calc = torch.from_numpy(labels_for_calc).long().to(device)
+
+    outputs = model(images_per_calc)
+    loss = criterion(outputs, labels_per_calc)
+    optimizer.zero_grad()  # zero (flush) the gradients from the previous iteration
+    loss.backward()  # calculate the gradients w.r.t the loss function (saved in tensor.grad field)
+
+    # aggregating the gradients of the calc and mul by relevant coefficients
+    for index_param, param in enumerate(model.parameters()):
+        total_grad_list[index_param] += np.array(param.grad.cpu(), dtype='float') * relevant_coefficient
+
+
+def worker_send_and_wait_total_gradients(total_gradient_list):
+    send_requests_total_gradients = [comm.Isend([total_gradient_list[index], MPI.FLOAT], dest=0, tag=index) for index in
+                                     range(num_params)]
+    MPI.Request.waitall(send_requests_total_gradients)
+
+
+def worker_send_data_to_master_and_wait(data, data_type, tag=None):
+    mpi_data_type = get_mpi_data_type(data_type)
+    if tag:
+        send_request = comm.Isend([np.array(data, dtype=data_type), mpi_data_type], dest=0, tag=tag)
+    else:
+        send_request = comm.Isend([np.array(data, dtype=data_type), mpi_data_type], dest=0)
+    send_request.wait()
 
 
 if __name__ == '__main__':
@@ -417,100 +485,61 @@ if __name__ == '__main__':
                                                            'mean_tp_calc_vect', 'mean_tp_grad_vect', 'tp_time_array'])
         df_metadata.to_excel('/home/ubuntu/cloud/metadata_fixed_5.xlsx')
 
-    else:  # ############################################################ Workers ##################################################################
+    else:  # ####################################### Workers #######################################################
         model.train()
         # ########### part 1: tp estimation #################
         for n in n_vect:
-            partition_vect = np.arange(start=0, stop=batch_size, step=(batch_size / n),
+            single_calc_batch_size = int(batch_size / n)
+            partition_vect = np.arange(start=0, stop=batch_size, step=single_calc_batch_size,
                                        dtype='i')  # vector of start indices for each possible calcs
             for d in range(1, n):
                 # receive code matrix
-                code_matrix = np.empty([n, n], dtype='float')
-                recv_req_code_matrix = comm.Irecv([code_matrix, MPI.FLOAT], source=0)
-                recv_req_code_matrix.wait()
+                code_matrix = worker_wait_and_receive_data_from_master([n, n], 'float')
 
                 for epoch in range(num_epocs_tp):
                     for i in range(num_runs_per_epoc):
                         if i == num_steps:
                             break
-                        
-                        labels_shape = np.empty([1], dtype='i')
-                        images_shape = np.empty([4], dtype='i')
 
-                        labels_shape_req = comm.Irecv([labels_shape, MPI.INT], source=0)
-                        images_shape_req = comm.Irecv([images_shape, MPI.INT], source=0)
-
-                        MPI.Request.waitall([labels_shape_req, images_shape_req])
+                        labels_shape = worker_wait_and_receive_data_from_master([1], 'i')
+                        images_shape = worker_wait_and_receive_data_from_master([4], 'i')
 
                         # recv new parameters from master and update them in your model
-                        recv_param_req = []
-                        param_buffer = [np.empty(param.size(), dtype='float') for param in model.parameters()]
-                        for index, param in enumerate(model.parameters()):
-                            recv_param_req.append(comm.Irecv([param_buffer[index], MPI.FLOAT], source=0,
-                                                             tag=batch_size + index))
-
-                        MPI.Request.waitall(recv_param_req)
+                        param_buffer = worker_wait_and_receive_model_params_from_master(model)
 
                         # recv labels and images
-                        images = np.empty(images_shape, dtype='float')
-                        labels = np.empty(labels_shape, dtype='i')
-
-                        images_req = comm.Irecv([images, MPI.FLOAT], source=0, tag=rank*2)
-                        labels_req = comm.Irecv([labels, MPI.INT], source=0, tag=rank*2+1)
-
-                        images_req.wait()
-                        labels_req.wait()
+                        images = worker_wait_and_receive_data_from_master(images_shape, 'float', tag=rank*2)
+                        labels = worker_wait_and_receive_data_from_master(labels_shape, 'i', tag=rank*2+1)
 
                         # get a code vect from the code matrix
-                        task_index = epoch * num_runs_per_epoc + i
-                        code_index = task_index % n
-                        code_vect = code_matrix[code_index, :]
-
-                        partition_vect_per_task = partition_vect[code_vect != 0]  # vector of relevant partition indices
-                        code_vec_sq = code_vect[code_vect != 0]  # vector of non-zero coeffs
+                        relevant_partition_indices, non_zero_code_coefficients = \
+                            get_relevant_batch_indices_and_coefficients_from_code_matrix(epoch, i, code_matrix)
 
                         # preforming specific job calculations
                         start_tp_calc_time = time.time()
                         tot_grad_list = [np.zeros(param.size(), dtype='float') for param in
                                          model.parameters()]  # initializing total gradient list
-                        for calc_num, index_calc_part in enumerate(partition_vect_per_task):
-                            # getting relevant images and labels for a calc from the job
-                            images_per_calc = torch.from_numpy(
-                                images[index_calc_part:index_calc_part + int(batch_size / n),
-                                :, :, :]).float().to(device)
-                            labels_per_calc = torch.from_numpy(
-                                labels[index_calc_part:index_calc_part + int(batch_size / n)]
-                                ).long().to(device)
+                        for calc_num, index_calc_part in enumerate(relevant_partition_indices):
 
-                            outputs = model(images_per_calc)
-                            loss = criterion(outputs, labels_per_calc)
-                            optimizer.zero_grad()  # zero (flush) the gradients from the previous iteration
-                            loss.backward()  # calculate the gradients w.r.t the loss function (saved in tensor.grad field)
+                            preform_a_calculation_and_update_total_gradient(
+                                tot_grad_list, images[index_calc_part:index_calc_part + single_calc_batch_size, :, :, :],
+                                labels[index_calc_part:index_calc_part + single_calc_batch_size],
+                                non_zero_code_coefficients[calc_num])
 
                             # print worker's learning status
                             if calc_num == 0 and (i + 1) % num_print_cycle == 0:
-                                print_to_console('Worker {}: Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}\n'
-                                                 .format(rank, epoch + 1, num_epocs_tp, i + 1, num_runs_per_epoc,
-                                                         loss.item()))
+                                print_to_console('Worker {}: Epoch [{}/{}], Step [{}/{}]\n'
+                                                 .format(rank, epoch + 1, num_epocs_tp, i + 1, num_runs_per_epoc))
 
-                            # aggregating the gradients of the calc and mul by relevant coefficients
-                            for inx_param, param in enumerate(model.parameters()):
-                                tot_grad_list[inx_param] += np.array(param.grad.cpu(), dtype='float') * code_vec_sq[
-                                    calc_num]
                         end_tp_calc_time = time.time()
 
                         # send_req_time = comm.Isend([np.array([end_tp_calc_time - start_tp_calc_time], dtype='float'),
                         #                             MPI.FLOAT], dest=0, tag=888888)
                         # send_req_time.wait()
 
-                        send_req_tot_grad_tp = [comm.Isend([tot_grad_list[index], MPI.FLOAT], dest=0, tag=index) for index in
-                                                range(num_params)]
+                        worker_send_and_wait_total_gradients(tot_grad_list)
 
-                        MPI.Request.waitall(send_req_tot_grad_tp)
-
-                        send_req_time = comm.Isend([np.array([start_tp_calc_time, end_tp_calc_time], dtype='float'),
-                                                    MPI.FLOAT], dest=0, tag=888888)
-                        send_req_time.wait()
+                        worker_send_data_to_master_and_wait([start_tp_calc_time, end_tp_calc_time], 'float', tag=888888)
 
                         # sys.stdout.write('Worker {}: tp grad time = {}\n'.format(rank, time.time()-end_tp_calc_time))
                         # sys.stdout.flush()
