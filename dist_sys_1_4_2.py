@@ -31,7 +31,7 @@ def get_mpi_data_type(data_type):
     return mpi_data_type
 
 
-# ######################### Master Functions #########################
+# ######################################### Master Functions #######################################
 
 def send_data_from_master_to_all_workers_and_wait(data, data_type, tags=None):
     send_reqs = []
@@ -39,7 +39,7 @@ def send_data_from_master_to_all_workers_and_wait(data, data_type, tags=None):
         mpi_data_type = get_mpi_data_type(data_type)
         if tags is not None:
             send_reqs.append(comm.Isend([np.array(data, dtype=data_type), mpi_data_type], dest=num_worker_rank,
-                                       tag=tags[num_worker_rank - 1]))
+                                        tag=tags[num_worker_rank - 1]))
         else:
             send_reqs.append(comm.Isend([np.array(data, dtype=data_type), mpi_data_type], dest=num_worker_rank))
     MPI.Request.waitall(send_reqs)
@@ -204,7 +204,7 @@ def update_tp_kp_time_if_needed(task_partitions, tasks_split, index_finished_tas
         finished_tp_kp_times[workers_rank - 1] = time.time()
 
 
-# ###################################### Workers Functions ###################################
+# ########################################### Workers Functions #############################################
 
 def worker_wait_and_receive_data_from_master(data_shape, data_type, tag=None):
     buffer = np.empty(data_shape, dtype=data_type)
@@ -313,8 +313,6 @@ if __name__ == '__main__':
 
     # create model, send it to device
     model = torchvision.models.resnet18(weights=None).to(device).float()
-    # model = nn.DataParallel(model)
-    # model.to(device).float()
     num_params = len(list(model.parameters()))
 
     # Loss and optimizer
@@ -367,11 +365,6 @@ if __name__ == '__main__':
                         send_data_from_master_to_all_workers_and_wait(labels, 'i',
                                                                       tags=np.arange(start=3, stop=2*size+1, step=2))
 
-                        # saving communication time, we assume the diff between cp of workers is negligible
-                        # end_cp_time = time.time()
-                        # cp_time_vect = end_cp_time_vect - start_cp_time
-                        #comm_time.append(end_cp_time - start_cp_time)
-
                         # receiving grads for single task from each worker
                         # create relevant buffers for grads
                         time_buffer_tp = get_buffers_for_workers([2], 'float')
@@ -388,9 +381,7 @@ if __name__ == '__main__':
                         append_part1_results_to_metadata_dict(start_cp_time, end_tp_time_vect, time_buffer_tp,
                                                               metadata_dict_part1)
 
-                # ########### part 2:optimal load split #################
-
-                # calc params for optimal load split
+                # ######################### part 2:optimal load split #########################
 
                 mean_tp_vect, var_tp_vect, mean_cp_vect, mean_tp_grad_vect, mean_tp_calc_vect, tp_time_array = \
                     get_timely_params_from_part_1(metadata_dict_part1)
@@ -401,6 +392,8 @@ if __name__ == '__main__':
                 # get optimal load split
                 task_split_vect = np.array(task_vect_calc.find_task_split(mean_tp_vect, var_tp_vect, mean_cp_vect,
                                                                           init_big_theta, gamma, n), dtype='i')
+                
+                # sending all workers flag about a second measurement in the case of a non-uniform task split
                 is_split_uni = np.array_equal(task_split_vect, np.ones_like(task_split_vect, dtype='i') *
                                               int(n/num_workers))
 
@@ -427,7 +420,6 @@ if __name__ == '__main__':
                     # send task partition indices to each worker (they already have the matrix)
                     send_partitions_from_mater_to_all_workers_and_wait(task_partition)
 
-                    # ############# copied from 1_2 #######################
                     for epoch in range(num_epocs_tp_kp):
                         for i, (images, labels) in enumerate(train_loader_CIFAR10):
                             if i == num_steps:
@@ -466,9 +458,6 @@ if __name__ == '__main__':
                                 get_tp_kp_and_iter_times_and_update_finished_tasks_grads_and_vects(
                                     start_iter_time, recv_job_vect_req, recv_grad_req, grad_buffer_list,
                                     job_vect_buffer_matrix, finished_jobs_grad_list, finished_jobs_mat)
-
-                            # sys.stdout.write('step = {}, Titer = {}\n'.format(i, finished_iter_time-start_iter_time))
-                            # sys.stdout.flush()
                             
                             tp_kp_time_vect_list.append(finished_tp_kp_time-start_iter_time)
                             t_iter_list.append(finished_iter_time-start_iter_time)
@@ -484,7 +473,6 @@ if __name__ == '__main__':
                                                    mean_time_iter, mean_tp_calc_vect, mean_tp_grad_vect,
                                                    tp_time_array]))
 
-                # ########################copied from 1_2#################################
         df_metadata = pd.DataFrame(metadata_list, columns=['n', 'd', 'k', 'omega', 'c', 'mean_tp_vect', 'var_tp_vect',
                                                            'mean_comm_time_vect', 'task_split_vect', 'mean_tp_kp_vect',
                                                            'var_tp_kp_vect', 'mismatch', 'mean_time_iter',
@@ -493,7 +481,7 @@ if __name__ == '__main__':
 
     else:  # ####################################### Workers #######################################################
         model.train()
-        # ########### part 1: tp estimation #################
+        # ######################### part 1: tp estimation #############################
         for n in n_vect:
             single_calc_batch_size = int(batch_size / n)
             partition_vect = np.arange(start=0, stop=batch_size, step=single_calc_batch_size,
@@ -539,16 +527,9 @@ if __name__ == '__main__':
 
                         end_tp_calc_time = time.time()
 
-                        # send_req_time = comm.Isend([np.array([end_tp_calc_time - start_tp_calc_time], dtype='float'),
-                        #                             MPI.FLOAT], dest=0, tag=888888)
-                        # send_req_time.wait()
-
                         worker_send_and_wait_total_gradients(tot_grad_list)
 
                         worker_send_data_to_master_and_wait([start_tp_calc_time, end_tp_calc_time], 'float', tag=888888)
-
-                        # sys.stdout.write('Worker {}: tp grad time = {}\n'.format(rank, time.time()-end_tp_calc_time))
-                        # sys.stdout.flush()
 
                 # ############################# part 2:optimal load split #############################
                 is_split_uni = worker_wait_and_receive_data_from_master([1], 'i')
@@ -562,7 +543,6 @@ if __name__ == '__main__':
                     # get relevant subset of task matrix
                     jobs_mat = code_matrix[code_mat_partition[0]:code_mat_partition[1], :]
 
-                    # ############# copied from 1_2 #######################
                     for epoch in range(num_epocs_tp_kp):
                         for i in range(num_runs_per_epoc):
                             if i == num_steps:
@@ -578,17 +558,9 @@ if __name__ == '__main__':
                             images = worker_wait_and_receive_data_from_master(images_shape, 'float', tag=rank * 2)
                             labels = worker_wait_and_receive_data_from_master(labels_shape, 'i', tag=rank * 2 + 1)
 
-                            # extracting all jobs properties
+                            # extracting num tasks
                             k_p = jobs_mat.shape[0]
-                            # n = jobs_mat.shape[1]
-                            # d = np.sum(jobs_mat[0, :] != 0)
-
-                            # calc and send gradients per job
-                            # send_job_vect_req = []
-                            # send_tot_grad_job_req = []
                             for task_p_inx in range(k_p):
-
-                                # start_job_calc_time = time.time()
 
                                 # extracting specific job properties
                                 task_p_vect = jobs_mat[task_p_inx, :]  # vector of coeff for the job
@@ -599,7 +571,6 @@ if __name__ == '__main__':
                                 tot_grad_list = [np.zeros(param.size(), dtype='float') for param in
                                                  model.parameters()]  # initializing total gradient list
                                 for calc_num, index_calc_part in enumerate(relevant_partition_indices_per_task):
-                                    # getting relevant images and labels for a calc from the job
 
                                     preform_a_calculation_and_update_total_gradient(
                                         tot_grad_list, images[index_calc_part:index_calc_part + single_calc_batch_size, :, :, :],
@@ -611,25 +582,9 @@ if __name__ == '__main__':
                                         print_to_console('Worker {}: Epoch [{}/{}], Step [{}/{}]\n'
                                                          .format(rank, epoch + 1, num_epocs_tp_kp, i + 1,
                                                                  num_runs_per_epoc))
-                                # end_job_calc_time = time.time()
 
                                 # sending total gradient of a job and its vector
-                                #send_job_vect_req.append(comm.Isend([job_p_vect, MPI.FLOAT], dest=0, tag=job_p_inx))
 
                                 worker_send_and_wait_total_gradients(tot_grad_list, is_part_2=True, task_inx=task_p_inx)
 
                                 worker_send_data_to_master_and_wait(task_p_vect, 'float', tag=task_p_inx)
-
-
-                                # send_job_vect_req = comm.Isend([job_p_vect, MPI.FLOAT], dest=0, tag=job_p_inx)
-                                # send_job_vect_req.wait()
-
-                                # end_job_send_time = time.time()
-
-                                # sys.stdout.write('Worker {}: job indx = {},  job calc time = {}, job send time = {}\n'
-                                #                    .format(rank, job_p_inx, end_job_calc_time - start_job_calc_time, 
-                                #                        end_job_send_time - end_job_calc_time))
-                                # sys.stdout.flush()
-
-                            # MPI.Request.waitall([*send_job_vect_req, *send_tot_grad_job_req])
-                    # ############# copied from 1_2 #######################
