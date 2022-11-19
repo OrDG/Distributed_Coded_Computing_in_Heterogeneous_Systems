@@ -52,6 +52,14 @@ def send_model_from_master_to_all_workers_and_wait(nn_model):
     MPI.Request.waitall(send_reqs)
 
 
+def send_partitions_from_mater_to_all_workers_and_wait(partition):
+    send_req = []
+    for num_worker_rank in range(1, size):
+        send_req.append(comm.Isend([partition[(num_worker_rank - 1):(num_worker_rank + 1)], MPI.INT],
+                                   dest=num_worker_rank))
+    MPI.Request.waitall(send_req)
+
+
 def get_dataset_train_loader_cifar10():
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
@@ -68,14 +76,15 @@ def get_dataset_train_loader_cifar10():
 def get_buffers_for_workers(buffer_size, buffer_type):
     buffers = []
     for num_worker_rank in range(1, size):
-        buffers.append(np.empty([buffer_size], dtype=buffer_type))
+        buffers.append(np.empty(buffer_size, dtype=buffer_type))
     return buffers
 
 
-def get_model_buffers_for_workers(nn_model):
+def get_model_buffers_for_workers(nn_model, copies_per_worker):
     buffers = []
     for num_worker_rank in range(1, size):
-        buffers.append([np.empty(param.size(), dtype='float') for param in nn_model.parameters()])
+        for inx in range(copies_per_worker[num_worker_rank - 1]):
+            buffers.append([np.empty(param.size(), dtype='float') for param in nn_model.parameters()])
     return buffers
 
 
@@ -96,6 +105,22 @@ def get_open_receive_requests_for_gradients_form_workers(nn_buffers, nn_model):
     return receive_requests
 
 
+def get_open_receive_requests_for_tasks_and_grads_from_workers(task_partitions, tasks_split, nn_model, job_vect_buffer,
+                                                               grad_buffer):
+    recv_grad_requests = []  # for getting job's gradients
+    recv_job_vect_requests = []  # for getting job's vector
+    for num_worker_rank in range(1, size):
+        for inx in range(tasks_split[num_worker_rank - 1]):
+            recv_job_vect_requests.append(
+                comm.Irecv([job_vect_buffer[task_partitions[num_worker_rank - 1] + inx, :],
+                            MPI.FLOAT], source=num_worker_rank, tag=inx))
+            for index_p, _ in enumerate(nn_model.parameters()):
+                recv_grad_requests.append(comm.Irecv(
+                    [grad_buffer[task_partitions[num_worker_rank - 1] + inx][index_p], MPI.FLOAT],
+                    source=num_worker_rank, tag=n * (index_p + 1) + inx))
+    return recv_job_vect_requests, recv_grad_requests
+
+
 def get_receive_times_for_gradients_by_notifications(receive_requests_gradients, receive_requests_notifications):
     receive_times = np.zeros((num_workers,), dtype='float')
     while not MPI.Request.Testall(receive_requests_notifications):
@@ -103,6 +128,30 @@ def get_receive_times_for_gradients_by_notifications(receive_requests_gradients,
         MPI.Request.waitall(receive_requests_gradients[index_worker*num_params:(index_worker+1)*num_workers])
         receive_times[index_worker] = time.time()
     return receive_times
+
+
+def get_tp_kp_and_iter_times_and_update_finished_tasks_grads_and_vects(
+        started_iter_time, recv_task_vect_req, recv_gradient_req, grad_buffer, task_buffer_matrix,
+        finished_tasks_grad_list, finished_tasks_mat):
+
+    finished_iter_time = started_iter_time  # only initiation
+    finished_tp_kp_time = np.ones((num_workers,), dtype='float') * started_iter_time
+    for num_finished_task in range(n):
+        index_finished_task, _ = MPI.Request.waitany(recv_task_vect_req)  # returns the finished req index
+        MPI.Request.waitall(recv_gradient_req[index_finished_task * num_params:(index_finished_task + 1) * num_params])
+
+        # sys.stdout.write('step = {}, indx finished job = {}, time since iter start = {}\n'
+        #                     .format(i, index_finished_job, time.time()-start_iter_time))
+        # sys.stdout.flush()
+
+        finished_tasks_grad_list[num_finished_task][:] = grad_buffer[index_finished_task][:]
+        finished_tasks_mat[num_finished_task, :] = task_buffer_matrix[index_finished_task, :]
+
+        finished_iter_time = time.time() if num_finished_task == k - 1 else finished_iter_time
+
+        update_tp_kp_time_if_needed(task_partition, task_split_vect, index_finished_task,
+                                    finished_tp_kp_time)
+    return finished_iter_time, finished_tp_kp_time
 
 
 def append_part1_results_to_metadata_dict(start_time, end_tp_time, time_buffer, dict_part1):
@@ -120,6 +169,37 @@ def append_part1_results_to_metadata_dict(start_time, end_tp_time, time_buffer, 
         dict_part1['tp_calc_time_vect_list'].append(tp_calc_time_vect)
         dict_part1['tp_grad_time_vect_list'].append(tp_grad_time_vect)
         dict_part1['cp_time_vect_list'].append(cp_time_vect)
+
+
+def get_timely_params_from_part_1(metadata_dict):
+    tp_time = np.array(metadata_dict['tp_time_vect_list'])
+    mean_tp = np.mean(tp_time, axis=0)
+    var_tp = np.var(tp_time, axis=0)
+    mean_cp = np.mean(np.array(metadata_dict['cp_time_vect_list']), axis=0)
+    mean_tp_grad = np.mean(np.array(metadata_dict['tp_grad_time_vect_list']), axis=0)
+    mean_tp_calc = np.mean(np.array(metadata_dict['tp_calc_time_vect_list']), axis=0)
+    return mean_tp, var_tp, mean_cp, mean_tp_grad, mean_tp_calc, tp_time
+
+
+def get_timely_params_from_part2(tp_kp_time_list, time_iter_list):
+    tp_kp_time_array = np.array(tp_kp_time_list, dtype='float')
+    mean_tp_kp_times = np.mean(tp_kp_time_array, axis=0)
+    var_tp_kp_times = np.var(tp_kp_time_array, axis=0)
+    second_moment_tp_kp_times = var_tp_kp_times + (mean_tp_kp_times ** 2)
+
+    prob_tp_kp_vect = mean_tp_kp_times + gamma * second_moment_tp_kp_times
+    mismatch_param = np.var(prob_tp_kp_vect)
+
+    mean_time_iteration = np.mean(np.array(time_iter_list, dtype='float'))
+
+    return mean_tp_kp_times, var_tp_kp_times, mismatch_param, mean_time_iteration
+
+
+def update_tp_kp_time_if_needed(task_partitions, tasks_split, index_finished_task, finished_tp_kp_times):
+    workers_rank = np.argmax(task_partitions - index_finished_task > 0)  # finds the worker rank because np.argmax returns the first True index
+    task_num = index_finished_task - task_partitions[workers_rank - 1]  # finds the jobs index per worker
+    if task_num == (tasks_split[workers_rank - 1] - 1):
+        finished_tp_kp_times[workers_rank - 1] = time.time()
 
 
 if __name__ == '__main__':
@@ -168,8 +248,8 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-    num_print_cycle = 20
-    num_steps = 100
+    num_print_cycle = 2
+    num_steps = 10
 
     if rank == 0:  # ######################################### Master ################################################
         # ########### part 1: tp estimation #################
@@ -220,8 +300,8 @@ if __name__ == '__main__':
 
                         # receiving grads for single task from each worker
                         # create relevant buffers for grads
-                        time_buffer_tp = get_buffers_for_workers(2, 'float')
-                        grad_buffer_tp = get_model_buffers_for_workers(model)
+                        time_buffer_tp = get_buffers_for_workers([2], 'float')
+                        grad_buffer_tp = get_model_buffers_for_workers(model, np.ones([num_workers], dtype='i'))
 
                         # opening recv req for finished notification and gradients
                         recv_req_time_tp = get_open_receive_requests_from_workers(time_buffer_tp, 'float', 888888)
@@ -237,27 +317,20 @@ if __name__ == '__main__':
                 # ########### part 2:optimal load split #################
 
                 # calc params for optimal load split
-                tp_time_array = np.array(metadata_dict_part1['tp_time_vect_list'])
-                mean_tp_vect = np.mean(tp_time_array, axis=0)
-                var_tp_vect = np.var(tp_time_array, axis=0)
-                mean_cp_vect = np.mean(np.array(metadata_dict_part1['cp_time_vect_list']), axis=0)
-                mean_tp_grad_vect = np.mean(np.array(metadata_dict_part1['tp_grad_time_vect_list']), axis=0)
-                mean_tp_calc_vect = np.mean(np.array(metadata_dict_part1['tp_calc_time_vect_list']), axis=0)
+
+                mean_tp_vect, var_tp_vect, mean_cp_vect, mean_tp_grad_vect, mean_tp_calc_vect, tp_time_array = \
+                    get_timely_params_from_part_1(metadata_dict_part1)
 
                 print_to_console('Master:\n mean Tp = {}, var Tp = {}, mean cp = {}, mean tp-calc = {}, mean tp-grad = {}\n'
                                  .format(mean_tp_vect, var_tp_vect, mean_cp_vect, mean_tp_calc_vect, mean_tp_grad_vect))
 
                 # get optimal load split
-                task_split_vect = task_vect_calc.find_task_split(mean_tp_vect, var_tp_vect, mean_cp_vect,
-                                                                 init_big_theta, gamma, n)
-                task_split_vect = np.array(task_split_vect, dtype='i')
+                task_split_vect = np.array(task_vect_calc.find_task_split(mean_tp_vect, var_tp_vect, mean_cp_vect,
+                                                                          init_big_theta, gamma, n), dtype='i')
                 is_split_uni = np.array_equal(task_split_vect, np.ones_like(task_split_vect, dtype='i') *
                                               int(n/num_workers))
 
-                send_req_is_split_uni = []
-                for worker_rank in range(1, size):
-                    send_req_is_split_uni.append(comm.Isend([np.array(int(is_split_uni), dtype='i'), MPI.INT], dest=worker_rank))
-                MPI.Request.waitall(send_req_is_split_uni)
+                send_data_from_master_to_all_workers_and_wait(int(is_split_uni), 'i')
 
                 for num_split_run in range(2):
                     if num_split_run == 1:
@@ -278,11 +351,7 @@ if __name__ == '__main__':
                     t_iter_list = []
 
                     # send task partition indices to each worker (they already have the matrix)
-                    send_req_partition = []
-                    for worker_rank in range(1, size):
-                        send_req_partition.append(comm.Isend([task_partition[(worker_rank-1):(worker_rank+1)], MPI.INT],
-                                                             dest=worker_rank))
-                    MPI.Request.waitall(send_req_partition)
+                    send_partitions_from_mater_to_all_workers_and_wait(task_partition)
 
                     # ############# copied from 1_2 #######################
                     for epoch in range(num_epocs_tp_kp):
@@ -291,106 +360,47 @@ if __name__ == '__main__':
                                 break
                             start_iter_time = time.time()
                             # sending train-data shapes to each worker
-                            send_reqs_labels_shapes = []
-                            send_reqs_images_shapes = []
-
-                            for worker_rank in range(1, size):
-                                send_reqs_labels_shapes.append(comm.Isend([np.array(labels.size(), dtype='i'), MPI.INT],
-                                                                          dest=worker_rank))
-                                send_reqs_images_shapes.append(comm.Isend([np.array(images.size(), dtype='i'), MPI.INT],
-                                                                          dest=worker_rank))
-                            MPI.Request.waitall([*send_reqs_labels_shapes, *send_reqs_images_shapes])
+                            send_data_from_master_to_all_workers_and_wait(labels.size(), 'i')
+                            send_data_from_master_to_all_workers_and_wait(images.size(), 'i')
 
                             # send new parameters of the model to the workers
-                            send_reqs_params = []
-                            for worker_rank in range(1, size):
-                                for index, param in enumerate(model.parameters()):
-                                    send_reqs_params.append(
-                                        comm.Isend([np.array(param.data.cpu(), dtype='float'), MPI.FLOAT],
-                                                   dest=worker_rank, tag=batch_size + index))
+                            send_model_from_master_to_all_workers_and_wait(model)
 
-                                    # sending train-data to each worker
-                            send_reqs_labels = []
-                            send_reqs_images = []
-
-                            for worker_rank in range(1, size):
-                                send_reqs_images.append(comm.Isend([np.array(images, dtype='float'), MPI.FLOAT],
-                                                                   dest=worker_rank, tag=worker_rank * 2))
-                                send_reqs_labels.append(
-                                    comm.Isend([np.array(labels, dtype='i'), MPI.INT], dest=worker_rank,
-                                               tag=2 * worker_rank + 1))
-
-                            MPI.Request.waitall([*send_reqs_images, *send_reqs_params, *send_reqs_labels])
+                            # sending train-data to each worker
+                            send_data_from_master_to_all_workers_and_wait(
+                                images, 'float', tags=np.arange(start=2, stop=2 * size, step=2))
+                            send_data_from_master_to_all_workers_and_wait(
+                                labels, 'i', tags=np.arange(start=3, stop=2 * size + 1, step=2))
 
                             # getting calculated gradients and job vectors from each worker
                             # opening buffers for Irecv
-                            grad_buffer_list = []  # for getting job's gradients
-                            job_vect_buffer_list = []  # for getting job's vector
-                            for worker_rank in range(1, size):
-                                for j in range(task_split_vect[worker_rank - 1]):
-                                    grad_buffer_list.append(
-                                        [np.empty(param.size(), dtype='float') for param in model.parameters()])  # creating buffer
-                                    job_vect_buffer_list.append(np.empty([n], dtype='float'))
+
+                            job_vect_buffer_matrix = np.empty([n, n], dtype='float')
+                            grad_buffer_list = get_model_buffers_for_workers(model, task_split_vect)
 
                             # opening Irecv requests for all possible jobs
-                            recv_grad_req = []  # for getting job's gradients
-                            recv_job_vect_req = []  # for getting job's vector
-                            for worker_rank in range(1, size):
-                                for j in range(task_split_vect[worker_rank - 1]):
-                                    recv_job_vect_req.append(
-                                        comm.Irecv([job_vect_buffer_list[task_partition[worker_rank - 1] + j], MPI.FLOAT],
-                                                   source=worker_rank, tag=j))
-                                    for index, param in enumerate(model.parameters()):
-                                        recv_grad_req.append(comm.Irecv(
-                                            [grad_buffer_list[task_partition[worker_rank - 1] + j][index], MPI.FLOAT],
-                                            source=worker_rank, tag=n * (index + 1) + j))
+                            recv_job_vect_req, recv_grad_req = get_open_receive_requests_for_tasks_and_grads_from_workers(
+                                task_partition, task_split_vect, model, job_vect_buffer_matrix, grad_buffer_list)
 
                             # initializing finished jobs mat and gradients
                             finished_jobs_mat = np.empty([n, n], dtype='float')
-                            finished_jobs_grad_list = []
-                            for inx_fin in range(n):
-                                finished_jobs_grad_list.append(
-                                    [np.empty(param.size(), dtype='float') for param in model.parameters()])
+                            finished_jobs_grad_list = get_model_buffers_for_workers(model, task_split_vect)
 
                             # waiting for only k jobs to be finished, and saving their gradients and vectors
-                            finished_iter_time = start_iter_time  # only initiation
-                            finished_tp_kp_time = np.ones((num_workers,), dtype='float') * start_iter_time
-                            for num_finished_job in range(n):
-                                index_finished_job, _ = MPI.Request.waitany(recv_job_vect_req)  # returns the finished req index
-                                MPI.Request.waitall(recv_grad_req[index_finished_job * num_params:(index_finished_job + 1) * num_params])
 
-                                # sys.stdout.write('step = {}, indx finished job = {}, time since iter start = {}\n'
-                                #                     .format(i, index_finished_job, time.time()-start_iter_time))
-                                # sys.stdout.flush()
+                            finished_iter_time, finished_tp_kp_time = \
+                                get_tp_kp_and_iter_times_and_update_finished_tasks_grads_and_vects(
+                                    start_iter_time, recv_job_vect_req, recv_grad_req, grad_buffer_list,
+                                    job_vect_buffer_matrix, finished_jobs_grad_list, finished_jobs_mat)
 
-                                finished_jobs_grad_list[num_finished_job][:] = grad_buffer_list[index_finished_job][:]
-                                finished_jobs_mat[num_finished_job, :] = job_vect_buffer_list[index_finished_job]
-
-                                if num_finished_job == k - 1:
-                                    finished_iter_time = time.time()
-
-                                worker_rank = np.argmax(task_partition - index_finished_job > 0)  # finds the worker rank because np.argmax returns the first True index
-                                job_num = index_finished_job - task_partition[worker_rank-1]  # finds the jobs index per worker
-                                if job_num == (task_split_vect[worker_rank-1] - 1):
-                                    finished_tp_kp_time[worker_rank-1] = time.time()
-
-                            # MPI.Request.waitall(recv_grad_req)
-                            
                             # sys.stdout.write('step = {}, Titer = {}\n'.format(i, finished_iter_time-start_iter_time))
                             # sys.stdout.flush()
                             
                             tp_kp_time_vect_list.append(finished_tp_kp_time-start_iter_time)
                             t_iter_list.append(finished_iter_time-start_iter_time)
 
-                    tp_kp_time_array = np.array(tp_kp_time_vect_list, dtype='float')
-                    mean_tp_kp_vect = np.mean(tp_kp_time_array, axis=0)
-                    var_tp_kp_vect = np.var(tp_kp_time_array, axis=0)
-                    second_moment_tp_kp_vect = var_tp_kp_vect + (mean_tp_kp_vect**2)
-
-                    prob_tp_kp_vect = mean_tp_kp_vect + gamma * second_moment_tp_kp_vect
-                    mismatch = np.var(prob_tp_kp_vect)
-
-                    mean_time_iter = np.mean(np.array(t_iter_list, dtype='float'))
+                    mean_tp_kp_vect, var_tp_kp_vect, mismatch, mean_time_iter = get_timely_params_from_part2(
+                        tp_kp_time_vect_list, t_iter_list)
 
                     print_to_console('Master:\n mean Tp_kp = {}, var Tp_kp = {}\n mismatch = {}, mean Titer = {}\n'
                                      .format(mean_tp_kp_vect, var_tp_kp_vect, mismatch, mean_time_iter))
@@ -405,7 +415,7 @@ if __name__ == '__main__':
                                                            'mean_comm_time_vect', 'task_split_vect', 'mean_tp_kp_vect',
                                                            'var_tp_kp_vect', 'mismatch', 'mean_time_iter',
                                                            'mean_tp_calc_vect', 'mean_tp_grad_vect', 'tp_time_array'])
-        df_metadata.to_excel('/home/ubuntu/cloud/metadata_fixed_4.xlsx')
+        df_metadata.to_excel('/home/ubuntu/cloud/metadata_fixed_5.xlsx')
 
     else:  # ############################################################ Workers ##################################################################
         model.train()
